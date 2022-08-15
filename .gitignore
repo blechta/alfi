@@ -1,5 +1,6 @@
 *.pyc
-alfi/__pycache__/*
+/alfi/__pycache__/*
+/build/
 *.egg-info
 *.vtu
 *.pvd

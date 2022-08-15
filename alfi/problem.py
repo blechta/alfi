@@ -27,6 +27,17 @@ class NavierStokesProblem(object):
     def bcs(self, Z):
         raise NotImplementedError
 
+    def bcs_inflow(self, W):
+        """Optional inflow BC used for the PCD preconditioner.
+        The space `W` is the mixed Laplacian space; RT times DG is used.
+        The Dirichlet value does not matter; PCD uses homogeneous BC.
+
+        If not implemented, the `bcs()` method is used, in which case
+        it assumed that the BC operates on the velocity space `W.sub(0)`
+        and the Dirichlet value has inflow direction only (for validity
+        of a priori estimates for preconditioner well-posedness)."""
+        raise NotImplementedError
+
     def has_nullspace(self):
         raise NotImplementedError
 

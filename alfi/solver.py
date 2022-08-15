@@ -1,24 +1,23 @@
 from firedrake import *
 from firedrake.petsc import *
+from firedrake.assemble import allocate_matrix, TwoFormAssembler
 import numpy as np
 from mpi4py import MPI
 
 from alfi.stabilisation import *
-# from alfi.element import velocity_element, pressure_element
-# from alfi.utilities import coarsen
 from alfi.transfer import *
+from alfi.petsc import MatNestSetVecType
 
 import pprint
 import sys
 from datetime import datetime
 
+
 class DGMassInv(PCBase):
 
     def initialize(self, pc):
-        _, P = pc.getOperators()
         appctx = self.get_appctx(pc)
         V = dmhooks.get_function_space(pc.getDM())
-        # get function spaces
         u = TrialFunction(V)
         v = TestFunction(V)
         massinv = assemble(Tensor(inner(u, v)*dx).inv)
@@ -38,6 +37,141 @@ class DGMassInv(PCBase):
         raise NotImplementedError("Sorry!")
 
 
+class PCD(PCBase):
+
+    def initialize(self, pc):
+        if pc.getType() != "python":
+            raise ValueError("Expecting PC type python")
+        prefix = pc.getOptionsPrefix() + "pcd_"
+
+        appctx = self.get_appctx(pc)
+        self.nu = appctx['nu']
+        advect = appctx['advect']
+        wind = split(appctx['z_last'])[0]
+        fc_params = appctx['form_compiler_parameters']
+        compute_bcs = appctx['bcs']
+        compute_bcs_inflow = appctx['bcs_inflow']
+        Q = dmhooks.get_function_space(pc.getDM())
+
+        if Q.ufl_element().family() != 'Discontinuous Lagrange':
+            raise NotImplementedError('This PCD implementation is for discontinuous '
+                                      'Lagrange pressure space only')
+        # NB: We're using variant='point', which is sufficient for zero BCs;
+        #     on the other hand the variant will affect the Powell-Silvester PC
+        V = FunctionSpace(Q.mesh(), 'Raviart-Thomas', Q.ufl_element().degree() + 1)
+        W = V*Q
+        try:
+            bcs = compute_bcs_inflow(W)
+        except NotImplementedError:
+            warning(RED % "'NavierStokesProblem.bcs_inflow()' not immplemented. "
+                    "Using 'bcs()' and assuming it has inflow direction only.")
+            bcs = compute_bcs(W)
+
+        # Pressure mass inverse
+        p = TrialFunction(Q)
+        q = TestFunction(Q)
+        m_inv = Tensor(p*q*dx).inv
+
+        # Operator for computing RHS for Laplace solve
+        v, _ = TestFunctions(W)
+        p = TrialFunction(Q)
+        # TODO: Could add the term vanishing on solenoidal winds
+        b = p*dot(advect*wind, v)*dx
+
+        # Mixed Laplacian
+        u, p = TrialFunctions(W)
+        v, q = TestFunctions(W)
+        a = ( p*div(v) - inner(u, v) + q*div(u) )*dx
+
+        opts = PETSc.Options()
+        default = parameters["default_matrix_type"]
+        Mp_mat_type = opts.getString(prefix+"Mp_mat_type", "matfree")
+        Bp_mat_type = opts.getString(prefix+"Bp_mat_type", "matfree")
+        Ap_mat_type = opts.getString(prefix+"Ap_mat_type", default)
+
+        self.Mp_inv = assemble(m_inv, bcs=None,
+                               form_compiler_parameters=fc_params,
+                               mat_type=Mp_mat_type,
+                               options_prefix=prefix + "Mp_")
+        self.Bp = allocate_matrix(b, bcs=bcs,
+                                  form_compiler_parameters=fc_params,
+                                  mat_type=Bp_mat_type,
+                                  options_prefix=prefix + "Bp_")
+        # FIXME: Add BCs and/or nullspace
+        #self._assemble_Bp = TwoFormAssembler(b, bcs=bcs, tensor=self.Bp,
+        #                                     form_compiler_parameters=fc_params).assemble
+        self._assemble_Bp = TwoFormAssembler(b, bcs=None, tensor=self.Bp,
+                                             form_compiler_parameters=fc_params).assemble
+        self._assemble_Bp()
+
+        #bc_dofs = bc.node_set.halo.local_to_global_numbering[bc.node_set.owned_indices]
+        #bc_vals = np.zeros(shape=dofs.shape, dtype=PETSc.ScalarType)
+        #def apply_bc_to_vec(v):
+        #    v.setValues(bc_dofs, bc_vals)
+        #    v.assemble()
+        #self.apply_bc_to_vec = apply_bc_to_vec
+        self.z = Function(W)
+        self.bcs = bcs
+
+        # FIXME: Add BCs and/or nullspace
+        Ap = assemble(a, bcs=bcs,
+                      form_compiler_parameters=fc_params,
+                      mat_type=Ap_mat_type,
+                      options_prefix=prefix + "Ap_")
+
+        MatNestSetVecType(Ap.petscmat, PETSc.Vec.Type.NEST)
+        self.w = Ap.petscmat.createVecLeft()
+
+        Aksp = PETSc.KSP().create(comm=pc.comm)
+        Aksp.incrementTabLevel(1, parent=pc)
+        Aksp.setOptionsPrefix(prefix + "Ap_")
+        Aksp.setOperators(Ap.petscmat)
+        Aksp.setUp()
+        Aksp.setFromOptions()
+        self.Aksp = Aksp
+        # FIXME: Use preconditioner!
+        #Minv, S = assemble_powell_silvester_preconditioner(Q, V)
+
+    def update(self, pc):
+        self._assemble_Bp()
+
+    def apply(self, pc, x, y):
+        self.Mp_inv.petscmat.mult(x, y)
+        #self.Bp.petscmat.mult(y, self.z)
+        #self.apply_bc_to_vec(self.z)
+        #self.Aksp.solve(self.z, self.w)
+        with self.z.vector().dat.vec_wo as z:
+            self.Bp.petscmat.mult(y, z)
+        for bc in self.bcs:
+            bc.zero(self.z)
+        with self.z.vector().dat.vec_ro as z:
+            self.Aksp.solve(z, self.w)
+        # FIXME: Sign?!?!
+        y.aypx(float(self.nu), self.w.getNestSubVecs()[1])
+
+    def applyTranspose(self, pc, x, y):
+        raise NotImplementedError
+
+    @staticmethod
+    def assemble_powell_silvester_preconditioner(Q, V):
+        u = TrialFunction(V)
+        v = TestFunction(V)
+        q = TestFuction(Q)
+        M = assemble(Tensor(inner(u, v)*dx, diagonal=True))
+        D = assemble(q*div(u)*dx)
+
+        D = D.petscmat
+        with M.vector().dat.vec_ro as M:
+            Minv = M.copy()
+        Minv.reciprocal()
+        Minvsqrt = Minv.copy()
+        Minvsqrt.sqrtabs()
+        D.diagonalScale(R=Minvsqrt)
+        S = D.matTransposeMult(D)
+
+        return Minv, S
+
+
 class NavierStokesSolver(object):
 
     def function_space(self, mesh, k):
@@ -45,7 +179,7 @@ class NavierStokesSolver(object):
 
     def residual(self):
         raise NotImplementedError
-    
+
     def update_wind(self, z):
         raise NotImplementedError
 
@@ -62,20 +196,36 @@ class NavierStokesSolver(object):
                  high_accuracy=False
                  ):
 
-        assert solver_type in {"almg", "allu", "lu", "simple", "lsc"}, "Invalid solver type %s" % solver_type
+        valid_solver_types = {
+            "allu", "almg", "alamg",
+            "pcdlu", "pcdmg", "pcdamg",
+            "lu", "simple", "lsc",
+        }
+        valid_stabilisation_types = {None, "gls", "supg", "burman"}
+        valid_hierarchy_types = {"uniform", "bary", "uniformbary"}
+        valid_patch_types = {"macro", "star"}
+        valid_patch_composition_types = {"additive", "multiplicative"}
+
+        if solver_type not in valid_solver_types:
+            raise ValueError(f"Invalid solver type '{solver_type}'")
         if stabilisation_type == "none":
             stabilisation_type = None
-        assert stabilisation_type in {None, "gls", "supg", "burman"}, "Invalid stabilisation type %s" % stabilisation_type
-        assert hierarchy in {"uniform", "bary", "uniformbary"}, "Invalid hierarchy type %s" % hierarchy
-        assert patch in {"macro", "star"}, "Invalid patch type %s" % patch
+        if stabilisation_type not in valid_stabilisation_types:
+            raise ValueError(f"Invalid stabilization type '{stabilisation_type}'")
+        if hierarchy not in valid_hierarchy_types:
+            raise ValueError(f"Invalid hierarchy type '{hierarchy}'")
+        if patch not in valid_patch_types:
+            raise ValueError(f"Invalid patch type '{patch}'")
         if hierarchy != "bary" and patch == "macro":
-            raise ValueError("macro patch only makes sense with a BaryHierarchy")
-        self.hierarchy = hierarchy
+            raise ValueError(f"'{patch}' patch only makes sense with 'bary' hierarchy")
+        if patch_composition not in valid_patch_composition_types:
+            raise ValueError(f"Invalid patch composition type '{patch_composition}'")
 
         self.problem = problem
         self.nref = nref
         self.solver_type = solver_type
         self.stabilisation_type = stabilisation_type
+        self.hierarchy = hierarchy
         self.patch = patch
         self.use_mkl = use_mkl
         self.patch_composition = patch_composition
@@ -125,14 +275,14 @@ class NavierStokesSolver(object):
         if not isinstance(gamma, Constant):
             gamma = Constant(gamma)
         self.gamma = gamma
-        if self.solver_type in ["simple", "lsc"]:
+        if self.solver_type in ["lu", "simple", "lsc", "pcdlu", "pcdmg", "pcdamg"]:
             self.gamma.assign(0)
             warning("Setting gamma to 0")
         self.advect = Constant(0)
 
         mesh = mh[-1]
         uviss = []
- 
+
         self.mesh = mesh
         self.load_balance(mesh)
         Z = self.function_space(mesh, k)
@@ -210,7 +360,7 @@ class NavierStokesSolver(object):
             elif supg_method == "shakib":
                 self.stabilisation = ShakibHughesZohanSUPG(1.0/nu, self.Z.sub(0), state=u, h=problem.mesh_size(u, "cell"), magic=supg_magic, weight=stabilisation_weight)
             else:
-                raise NotImplementedError
+                raise ValueError(f"Invalid supg method '{supg_method}'")
 
             Lu = -nu * div(2*sym(grad(u))) + dot(grad(u), u) + grad(p)
             Lv = -nu * div(2*sym(grad(v))) + dot(grad(v), wind) + grad(q)
@@ -236,7 +386,14 @@ class NavierStokesSolver(object):
         if rhs is not None:
             F -= inner(rhs[0], v) * dx + inner(rhs[1], q) * dx
 
-        appctx = {"nu": self.nu, "gamma": self.gamma}
+        appctx = {
+            "nu": self.nu,
+            "gamma": self.gamma,
+            "advect": self.advect,
+            "z_last": self.z_last,
+            "bcs": problem.bcs,
+            "bcs_inflow": problem.bcs_inflow,
+        }
         problem = NonlinearVariationalProblem(F, z, bcs=bcs)
         self.bcs = bcs
         self.params = params
@@ -383,13 +540,25 @@ class NavierStokesSolver(object):
             "pc_type": "hypre",
         }
 
-        fieldsplit_1 = {
+        fieldsplit_1_mass = {
             "ksp_type": "preonly",
             "pc_type": "python",
-            "pc_python_type": "alfi.solver.DGMassInv"
+            "pc_python_type": "alfi.solver.DGMassInv",
         }
-
-        use_mg = self.solver_type == "almg"
+        fieldsplit_1_pcd = {
+            "ksp_type": "preonly",
+            "pc_type": "python",
+            "pc_python_type": "alfi.solver.PCD",
+            "pcd_Mp_mat_type": "aij",
+            "pcd_Bp_mat_type": "nest",
+            "pcd_Bp_mat_type": "nest",
+            #"pcd_Bp_mat_type": "aij",
+            #"pcd_Ap_mat_type": "aij",
+            #"pcd_Ap_ksp_type": "preonly",
+            #"pcd_Ap_pc_type": "lu",
+            #"pcd_Ap_pc_factor_mat_solver_type": "mumps",
+            "pcd_Ap_ksp_monitor": None,
+        }
 
         outer_lu = {
             "mat_type": "aij",
@@ -414,10 +583,23 @@ class NavierStokesSolver(object):
                 "allu": fieldsplit_0_lu,
                 "almg": fieldsplit_0_mg,
                 "alamg": fieldsplit_0_amg,
+                "pcdlu": fieldsplit_0_lu,
+                # TODO: A simpler MG might work when no augmentation term
+                "pcdmg": fieldsplit_0_mg,
+                "pcdamg": fieldsplit_0_amg,
                 "lu": None,
                 "simple": None,
                 "lsc": None}[self.solver_type],
-            "fieldsplit_1": fieldsplit_1,
+            "fieldsplit_1": {
+                "allu": fieldsplit_1_mass,
+                "almg": fieldsplit_1_mass,
+                "alamg": fieldsplit_1_mass,
+                "pcdlu": fieldsplit_1_pcd,
+                "pcdmg": fieldsplit_1_pcd,
+                "pcdamg": fieldsplit_1_pcd,
+                "lu": None,
+                "simple": None,
+                "lsc": None}[self.solver_type],
         }
 
         outer_simple = {
@@ -502,7 +684,7 @@ class NavierStokesSolver(object):
 
         if self.solver_type == "lu":
             outer = {**outer_base, **outer_lu}
-        elif self.solver_type == "simple": 
+        elif self.solver_type == "simple":
             outer = {**outer_base, **outer_simple}
         elif self.solver_type == "lsc":
             outer = {**outer_base, **outer_lsc}

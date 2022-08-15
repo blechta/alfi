@@ -14,7 +14,6 @@ iters2dsv: pre
 	$(exec) iters.py --nref-start 1 --nref-end 4 --problem ldc2d --k 2 --baseN 16          --solver-type almg --discretisation pkp0 --mh uniform --stabilisation-type supg   --patch star   --smoothing 6 --restriction 2>&1 | tee logs/iters2dsvldccompp2p0restrict.log
 	$(exec) iters.py --nref-start 1 --nref-end 4 --problem bfs2d --k 2 --mesh coarse09.msh --solver-type almg --discretisation sv --mh bary --stabilisation-type burman --patch macro --smoothing 6 --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/iters2dsvbfs09restrict5em3k2.log
 	$(exec) iters.py --nref-start 1 --nref-end 3 --problem bfs2d --k 3 --mesh coarse09.msh --solver-type almg --discretisation sv --mh bary --stabilisation-type burman --patch macro --smoothing 6 --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/iters2dsvbfs09restrict5em3k3.log
-	
 
 mms3dpkp0: pre
 	$(exec) mms.py --dim 3 --k 1 --nref 5 --discretisation pkp0 --solver-type almg --mh uniform --patch star --gamma 1e4 --stabilisation-type supg --stabilisation--weight 0.05 --baseN 4 2>&1 | tee logs/mms3dpkp0highgamma.log
@@ -31,3 +30,7 @@ idealal:
 	$(exec) iters.py --baseN 16 --nref-start 2 --nref-end 2 --problem ldc2d --k 2 --solver-type allu --discretisation pkp0 --mh uniform --stabilisation-type supg --smoothing 6 --restriction --time --re-max 10000 --gamma 1e2 2>&1 | tee logs/idealalgamma1e2.log || 1
 	$(exec) iters.py --baseN 16 --nref-start 2 --nref-end 2 --problem ldc2d --k 2 --solver-type allu --discretisation pkp0 --mh uniform --stabilisation-type supg --smoothing 6 --restriction --time --re-max 10000 --gamma 1e3 2>&1 | tee logs/idealalgamma1e3.log || 1
 	$(exec) iters.py --baseN 16 --nref-start 2 --nref-end 2 --problem ldc2d --k 2 --solver-type allu --discretisation pkp0 --mh uniform --stabilisation-type supg --smoothing 6 --restriction --time --re-max 10000 --gamma 1e4 2>&1 | tee logs/idealalgamma1e4.log || 1
+
+pcd:
+	$(exec) iters.py --nref-start 1 --nref-end 2 --problem bfs2d --k 2 --mesh coarse09.msh --solver-type pcdlu --discretisation sv --stabilisation-type burman --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/bfsk2.log
+	$(exec) iters.py --nref-start 1 --nref-end 2 --problem bfs2d --k 3 --mesh coarse09.msh --solver-type pcdlu --discretisation sv --stabilisation-type burman --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/bfsk3.log
