@@ -6,7 +6,6 @@ from mpi4py import MPI
 
 from alfi.stabilisation import *
 from alfi.transfer import *
-from alfi.petsc import MatNestSetVecType
 
 import pprint
 import sys
@@ -61,11 +60,11 @@ class PCD(PCBase):
         V = FunctionSpace(Q.mesh(), 'Raviart-Thomas', Q.ufl_element().degree() + 1)
         W = V*Q
         try:
-            bcs = compute_bcs_inflow(W)
+            self.bcs = compute_bcs_inflow(W)
         except NotImplementedError:
             warning(RED % "'NavierStokesProblem.bcs_inflow()' not immplemented. "
                     "Using 'bcs()' and assuming it has inflow direction only.")
-            bcs = compute_bcs(W)
+            self.bcs = compute_bcs(W)
 
         # Pressure mass inverse
         p = TrialFunction(Q)
@@ -93,34 +92,20 @@ class PCD(PCBase):
                                form_compiler_parameters=fc_params,
                                mat_type=Mp_mat_type,
                                options_prefix=prefix + "Mp_")
-        self.Bp = allocate_matrix(b, bcs=bcs,
+        self.Bp = allocate_matrix(b, bcs=None,
                                   form_compiler_parameters=fc_params,
                                   mat_type=Bp_mat_type,
                                   options_prefix=prefix + "Bp_")
-        # FIXME: Add BCs and/or nullspace
-        #self._assemble_Bp = TwoFormAssembler(b, bcs=bcs, tensor=self.Bp,
-        #                                     form_compiler_parameters=fc_params).assemble
+        # NB: There's not a good support for bcs on rectangular systems in Firedrake
         self._assemble_Bp = TwoFormAssembler(b, bcs=None, tensor=self.Bp,
                                              form_compiler_parameters=fc_params).assemble
         self._assemble_Bp()
 
-        #bc_dofs = bc.node_set.halo.local_to_global_numbering[bc.node_set.owned_indices]
-        #bc_vals = np.zeros(shape=dofs.shape, dtype=PETSc.ScalarType)
-        #def apply_bc_to_vec(v):
-        #    v.setValues(bc_dofs, bc_vals)
-        #    v.assemble()
-        #self.apply_bc_to_vec = apply_bc_to_vec
-        self.z = Function(W)
-        self.bcs = bcs
-
-        # FIXME: Add BCs and/or nullspace
-        Ap = assemble(a, bcs=bcs,
+        # FIXME: Consider nullspace
+        Ap = assemble(a, bcs=self.bcs,
                       form_compiler_parameters=fc_params,
                       mat_type=Ap_mat_type,
                       options_prefix=prefix + "Ap_")
-
-        MatNestSetVecType(Ap.petscmat, PETSc.Vec.Type.NEST)
-        self.w = Ap.petscmat.createVecLeft()
 
         Aksp = PETSc.KSP().create(comm=pc.comm)
         Aksp.incrementTabLevel(1, parent=pc)
@@ -129,6 +114,11 @@ class PCD(PCBase):
         Aksp.setUp()
         Aksp.setFromOptions()
         self.Aksp = Aksp
+
+        # Work functions
+        self.z = Function(W)
+        self.w = Function(W)
+
         # FIXME: Use preconditioner!
         #Minv, S = assemble_powell_silvester_preconditioner(Q, V)
 
@@ -137,17 +127,16 @@ class PCD(PCBase):
 
     def apply(self, pc, x, y):
         self.Mp_inv.petscmat.mult(x, y)
-        #self.Bp.petscmat.mult(y, self.z)
-        #self.apply_bc_to_vec(self.z)
-        #self.Aksp.solve(self.z, self.w)
         with self.z.vector().dat.vec_wo as z:
             self.Bp.petscmat.mult(y, z)
         for bc in self.bcs:
             bc.zero(self.z)
         with self.z.vector().dat.vec_ro as z:
-            self.Aksp.solve(z, self.w)
-        # FIXME: Sign?!?!
-        y.aypx(float(self.nu), self.w.getNestSubVecs()[1])
+            with self.w.vector().dat.vec_wo as w:
+                self.Aksp.solve(z, w)
+        with self.w.sub(1).vector().dat.vec_ro as p:
+            # FIXME: Sign?!?! See the sign in DGMassInv
+            y.aypx(float(self.nu), p)
 
     def applyTranspose(self, pc, x, y):
         raise NotImplementedError
@@ -550,13 +539,11 @@ class NavierStokesSolver(object):
             "pc_type": "python",
             "pc_python_type": "alfi.solver.PCD",
             "pcd_Mp_mat_type": "aij",
-            "pcd_Bp_mat_type": "nest",
-            "pcd_Bp_mat_type": "nest",
-            #"pcd_Bp_mat_type": "aij",
-            #"pcd_Ap_mat_type": "aij",
-            #"pcd_Ap_ksp_type": "preonly",
-            #"pcd_Ap_pc_type": "lu",
-            #"pcd_Ap_pc_factor_mat_solver_type": "mumps",
+            "pcd_Bp_mat_type": "aij",
+            "pcd_Ap_mat_type": "aij",
+            "pcd_Ap_ksp_type": "preonly",
+            "pcd_Ap_pc_type": "lu",
+            "pcd_Ap_pc_factor_mat_solver_type": "mumps",
             "pcd_Ap_ksp_monitor": None,
         }
 
