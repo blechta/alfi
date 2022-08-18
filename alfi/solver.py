@@ -41,15 +41,17 @@ class PCD(PCBase):
     def initialize(self, pc):
         if pc.getType() != "python":
             raise ValueError("Expecting PC type python")
+        opts = PETSc.Options()
         prefix = pc.getOptionsPrefix() + "pcd_"
-
         appctx = self.get_appctx(pc)
+
         self.nu = appctx['nu']
         advect = appctx['advect']
-        wind = split(appctx['z_last'])[0]
+        wind = split(appctx['state'])[0]
         fc_params = appctx['form_compiler_parameters']
         compute_bcs = appctx['bcs']
         compute_bcs_inflow = appctx['bcs_inflow']
+        self.has_nullspace = appctx['has_nullspace']
         Q = dmhooks.get_function_space(pc.getDM())
 
         if Q.ufl_element().family() != 'Discontinuous Lagrange':
@@ -62,7 +64,7 @@ class PCD(PCBase):
         try:
             self.bcs = compute_bcs_inflow(W)
         except NotImplementedError:
-            warning(RED % "'NavierStokesProblem.bcs_inflow()' not immplemented. "
+            warning(RED % "'NavierStokesProblem.bcs_inflow()' not implemented. "
                     "Using 'bcs()' and assuming it has inflow direction only.")
             self.bcs = compute_bcs(W)
 
@@ -72,41 +74,40 @@ class PCD(PCBase):
         m_inv = Tensor(p*q*dx).inv
 
         # Operator for computing RHS for Laplace solve
-        v, _ = TestFunctions(W)
+        v, q = TestFunctions(W)
         p = TrialFunction(Q)
-        # TODO: Could add the term vanishing on solenoidal winds
-        b = p*dot(advect*wind, v)*dx
+        alpha = opts.getReal(prefix+"Bp_alpha", 1)
+        alpha = alpha if alpha in [0, 0.5, 1] else Constant(alpha)
+        b = p*advect*(dot(wind, v) - (1-alpha)*div(wind)*q)*dx
 
         # Mixed Laplacian
         u, p = TrialFunctions(W)
         v, q = TestFunctions(W)
         a = ( p*div(v) - inner(u, v) + q*div(u) )*dx
 
-        opts = PETSc.Options()
-        default = parameters["default_matrix_type"]
         Mp_mat_type = opts.getString(prefix+"Mp_mat_type", "matfree")
         Bp_mat_type = opts.getString(prefix+"Bp_mat_type", "matfree")
-        Ap_mat_type = opts.getString(prefix+"Ap_mat_type", default)
+        Ap_mat_type = opts.getString(prefix+"Ap_mat_type", parameters["default_matrix_type"])
 
         self.Mp_inv = assemble(m_inv, bcs=None,
                                form_compiler_parameters=fc_params,
                                mat_type=Mp_mat_type,
                                options_prefix=prefix + "Mp_")
+
         self.Bp = allocate_matrix(b, bcs=None,
                                   form_compiler_parameters=fc_params,
                                   mat_type=Bp_mat_type,
                                   options_prefix=prefix + "Bp_")
-        # NB: There's not a good support for bcs on rectangular systems in Firedrake
+        # NB: There's not a complete support for bcs on rectangular systems in Firedrake
+        #     so handle bcs separately
         self._assemble_Bp = TwoFormAssembler(b, bcs=None, tensor=self.Bp,
                                              form_compiler_parameters=fc_params).assemble
         self._assemble_Bp()
 
-        # FIXME: Consider nullspace
         Ap = assemble(a, bcs=self.bcs,
                       form_compiler_parameters=fc_params,
                       mat_type=Ap_mat_type,
                       options_prefix=prefix + "Ap_")
-
         Aksp = PETSc.KSP().create(comm=pc.comm)
         Aksp.incrementTabLevel(1, parent=pc)
         Aksp.setOptionsPrefix(prefix + "Ap_")
@@ -119,13 +120,36 @@ class PCD(PCBase):
         self.z = Function(W)
         self.w = Function(W)
 
+        if self.has_nullspace:
+            q = TestFunction(Q)
+            area = appctx['area']
+            mean_value_functional = q/Constant(area)*dx
+            self.Np = assemble(mean_value_functional, bcs=None,
+                               form_compiler_parameters=fc_params,
+                               options_prefix=prefix + "Np_")
+            # FIXME: We should pin the pressure in the self.Aksp solve
+            #        if using a direct solver
+
         # FIXME: Use preconditioner!
         #Minv, S = assemble_powell_silvester_preconditioner(Q, V)
+
+        # DEBUG statement
+        warning(RED % f"PCD initialize: ||div(wind)|| = {norm(div(wind))}")
 
     def update(self, pc):
         self._assemble_Bp()
 
+        # DEBUG statement
+        appctx = self.get_appctx(pc)
+        wind = split(appctx['state'])[0]
+        warning(RED % f"PCD update: ||div(wind)|| = {norm(div(wind))}")
+
     def apply(self, pc, x, y):
+        # DEBUG statement
+        if self.has_nullspace:
+            with self.Np.vector().dat.vec_ro as Np:
+                warning(RED % f"PCD apply: mean(x) = {Np.dot(x)}")
+
         self.Mp_inv.petscmat.mult(x, y)
         with self.z.vector().dat.vec_wo as z:
             self.Bp.petscmat.mult(y, z)
@@ -134,9 +158,26 @@ class PCD(PCBase):
         with self.z.vector().dat.vec_ro as z:
             with self.w.vector().dat.vec_wo as w:
                 self.Aksp.solve(z, w)
+
+        if self.has_nullspace:
+            p = self.w.sub(1)
+            mean = self.Np.vector().inner(p.vector())
+            warning(RED % f"PCD apply mean(p) = {mean} (before orthogonalization)") # DEBUG statement
+            p -= mean
+            mean = self.Np.vector().inner(p.vector())
+            warning(RED % f"PCD apply mean(p) = {mean} (after 1st orthogonalization)") # DEBUG statement
+            p -= mean
+            mean = self.Np.vector().inner(p.vector()) # DEBUG statement
+            warning(RED % f"PCD apply mean(p) = {mean} (after 2nd orthogonalization)") # DEBUG statement
+
         with self.w.sub(1).vector().dat.vec_ro as p:
             # FIXME: Sign?!?! See the sign in DGMassInv
             y.aypx(float(self.nu), p)
+
+        # DEBUG statement
+        if self.has_nullspace:
+            with self.Np.vector().dat.vec_ro as Np:
+                warning(RED % f"PCD apply: mean(y) = {Np.dot(y)}")
 
     def applyTranspose(self, pc, x, y):
         raise NotImplementedError
@@ -156,6 +197,8 @@ class PCD(PCBase):
         Minvsqrt = Minv.copy()
         Minvsqrt.sqrtabs()
         D.diagonalScale(R=Minvsqrt)
+        # FIXME: Seems like we can do this preconditioner directly in PETSc by
+        #        -pc_fieldsplit_schur_precondition selfp
         S = D.matTransposeMult(D)
 
         return Minv, S
@@ -352,6 +395,8 @@ class NavierStokesSolver(object):
                 raise ValueError(f"Invalid supg method '{supg_method}'")
 
             Lu = -nu * div(2*sym(grad(u))) + dot(grad(u), u) + grad(p)
+            # FIXME: Is this intended that wind is only updated after SNES completes?!?
+            #        And does the update work?
             Lv = -nu * div(2*sym(grad(v))) + dot(grad(v), wind) + grad(q)
             if rhs is not None:
                 Lu -= rhs[0]
@@ -379,9 +424,10 @@ class NavierStokesSolver(object):
             "nu": self.nu,
             "gamma": self.gamma,
             "advect": self.advect,
-            "z_last": self.z_last,
             "bcs": problem.bcs,
             "bcs_inflow": problem.bcs_inflow,
+            "area": self.area,
+            "has_nullspace": problem.has_nullspace(),
         }
         problem = NonlinearVariationalProblem(F, z, bcs=bcs)
         self.bcs = bcs
@@ -495,6 +541,7 @@ class NavierStokesSolver(object):
             "pc_type": "lu",
             "pc_factor_mat_solver_type": "mkl_pardiso" if self.use_mkl else "mumps",
             "mat_mumps_icntl_14": 150,
+            "ksp_monitor": None,
         }
 
         size = self.mesh.mpi_comm().size
@@ -563,8 +610,8 @@ class NavierStokesSolver(object):
             "ksp_max_it": 500,
             "pc_type": "fieldsplit",
             "pc_fieldsplit_type": "schur",
-            # "pc_fieldsplit_schur_factorization_type": "upper",
-            "pc_fieldsplit_schur_factorization_type": "full",
+            "pc_fieldsplit_schur_factorization_type": "upper",
+            #"pc_fieldsplit_schur_factorization_type": "full",
             "pc_fieldsplit_schur_precondition": "user",
             "fieldsplit_0": {
                 "allu": fieldsplit_0_lu,
@@ -638,6 +685,8 @@ class NavierStokesSolver(object):
             "snes_linesearch_monitor": None,
             "snes_converged_reason": None,
             "ksp_type": "fgmres",
+            "ksp_gmres_restart": 256,
+            "ksp_gmres_modifiedgramschmidt": None,
             "ksp_monitor_true_residual": None,
             "ksp_converged_reason": None,
         }
@@ -652,9 +701,14 @@ class NavierStokesSolver(object):
         else:
             if self.tdim == 2:
                 tolerances = {
-                    "ksp_rtol": 1.0e-9,
-                    "ksp_atol": 1.0e-10,
-                    "snes_rtol": 1.0e-9,
+                    #"ksp_rtol": 1.0e-9,
+                    #"ksp_atol": 1.0e-10,
+                    #"snes_rtol": 1.0e-9,
+                    #"snes_atol": 1.0e-8,
+                    #"snes_stol": 1.0e-6,
+                    "ksp_rtol": 1.0e-3,
+                    "ksp_atol": 1.0e-5,
+                    "snes_rtol": 1.0e-6,
                     "snes_atol": 1.0e-8,
                     "snes_stol": 1.0e-6,
                 }

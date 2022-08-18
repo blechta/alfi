@@ -1,4 +1,7 @@
-exec=mpirun -n 12 python3
+SHELL=/bin/bash -o pipefail
+#exec=mpirun -n 12 python3
+#exec=mpirun -n 3 python3
+exec=python3
 pre:
 	mkdir -p logs/
 
@@ -34,3 +37,4 @@ idealal:
 pcd:
 	$(exec) iters.py --nref-start 1 --nref-end 2 --problem bfs2d --k 2 --mesh coarse09.msh --solver-type pcdlu --discretisation sv --stabilisation-type burman --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/bfsk2.log
 	$(exec) iters.py --nref-start 1 --nref-end 2 --problem bfs2d --k 3 --mesh coarse09.msh --solver-type pcdlu --discretisation sv --stabilisation-type burman --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/bfsk3.log
+	$(exec) iters.py --nref-start 1 --nref-end 2 --problem ldc2d --k 3 --baseN 10          --solver-type pcdlu --discretisation sv --stabilisation-type burman --restriction --stabilisation-weight 5e-3 2>&1 | tee logs/ldck3.log
